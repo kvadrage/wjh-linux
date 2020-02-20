@@ -472,44 +472,63 @@ class EventFormatInflux(object):
         def convert_field(self, value, conversion):
             if conversion == 'w':
                 return str(value).replace(' ', '\\ ')
+            if conversion == 's':
+                return '"{}"'.format(value)
+            if conversion == 'i':
+                return '{}i'.format(value)
             else:
                 return string.Formatter.convert_field(self, value, conversion)    
 
-    _fmt_influx_packet_ethernet = '''
-packet_ethernet_etherType={etherType},
-packet_ethernet_etherTypeName={etherTypeName!w},
-packet_ethernet_dstMac={dstMac},
-packet_ethernet_srcMac={srcMac},
-packet_ethernet_pcp={pcp},
-packet_ethernet_vlanId={vlanId},
+    _fmt_influx_tags_ethernet = '''
+packet_ethernet_dstMac={dstMac!w},
+packet_ethernet_srcMac={srcMac!w},
 '''
-    _fmt_influx_packet_ip = '''
-packet_ip_srcIp={srcIp},
-packet_ip_dstIp={dstIp},
-packet_ip_length={length},
-packet_ip_protocol={protocol},
-packet_ip_protocolName={protocolName!w},
-packet_ip_tos={tos},
-packet_ip_ttl={ttl},
+    _fmt_influx_tags_ip = '''
+packet_ip_srcIp={srcIp!w},
 '''
-    _fmt_influx_packet_transport = '''
-packet_transport_dstPort={dstPort},
-packet_transport_dstPortName={dstPortName!w},
-packet_transport_srcPort={srcPort},
-packet_transport_srcPortName={srcPortName!w},
+    _fmt_influx_tags_transport = '''
+packet_transport_dstPort={dstPort!w},
 '''
-    _fmt_influx = '''
-DroppedPackets,description={description!w},
+    _fmt_influx_tags = '''
+description={description!w},
 deviceIP={deviceIP!w},
 dropReason={dropReason!w},
 dropType={dropType!w},
 ingressPort={ingressPort!w},
 message={message!w},
-{ethernet}
-{ip}
-{transport}
-severity={severity!w} packet_packetType="{packetType}",
-timestamp="{timestamp}" {influx_timestamp}
+{packet_ethernet}
+{packet_ip}
+{packet_transport}
+packet_packetType={packet_type!w},
+severity={severity!w}
+'''
+    _fmt_influx_fields_ethernet = '''
+packet_ethernet_etherType={etherType!i},
+packet_ethernet_etherTypeName={etherTypeName!s},
+'''
+#packet_ethernet_pcp={pcp!i},
+#packet_ethernet_vlanId={vlanId!i},
+    _fmt_influx_fields_ip = '''
+packet_ip_dstIp={dstIp!s},
+packet_ip_length={length!i},
+packet_ip_protocol={protocol!i},
+packet_ip_protocolName={protocolName!s},
+packet_ip_tos={tos!i},
+packet_ip_ttl={ttl!i},
+'''
+    _fmt_influx_fields_transport = '''
+packet_transport_dstPortName={dstPortName!s},
+packet_transport_srcPort={srcPort!i},
+packet_transport_srcPortName={srcPortName!s},
+'''
+    _fmt_influx_fields = '''
+{packet_ethernet}
+{packet_ip}
+{packet_transport}
+timestamp={timestamp!s}
+'''
+    _fmt_influx = '''
+DroppedPackets,{influx_tags} {influx_fields} {influx_timestamp}
 '''
     def __init__(self, event):
         self.event = event
@@ -519,27 +538,43 @@ timestamp="{timestamp}" {influx_timestamp}
         ev = self.event
         packet = ev["packet"]
         packet_type = packet["packetType"].lower()
-        influx_packet_eth = ""
-        influx_packet_ip = ""
-        influx_packet_transport = ""
+        tags_packet_eth = ""
+        tags_packet_ip = ""
+        tags_packet_transport = ""
+        fields_packet_eth = ""
+        fields_packet_ip = ""
+        fields_packet_transport = ""
         
         if packet_type in ("ethernet", "ip", "transport"):
-            influx_packet_eth = fmt.format(self._fmt_influx_packet_ethernet,
+            tags_packet_eth = fmt.format(self._fmt_influx_tags_ethernet,
+                                           **packet["ETHERNET"])
+            fields_packet_eth = fmt.format(self._fmt_influx_fields_ethernet,
                                            **packet["ETHERNET"])
         if packet_type in ("ip", "transport"):
-            influx_packet_ip = fmt.format(self._fmt_influx_packet_ip, **packet["IP"])
+            tags_packet_ip = fmt.format(self._fmt_influx_tags_ip, **packet["IP"])
+            fields_packet_ip = fmt.format(self._fmt_influx_fields_ip, **packet["IP"])
         if packet_type == "transport":
-            influx_packet_transport = fmt.format(self._fmt_influx_packet_transport,
+            tags_packet_transport = fmt.format(self._fmt_influx_tags_transport,
                                                  **packet["TRANSPORT"])
-            
-        timestamp = int(time.time() * 1000000)
-        line = fmt.format(self._fmt_influx,
-                          packetType=packet_type,
-                          ethernet=influx_packet_eth,
-                          ip=influx_packet_ip,
-                          transport=influx_packet_transport,
-                          influx_timestamp=timestamp,
+            fields_packet_transport = fmt.format(self._fmt_influx_fields_transport,
+                                                 **packet["TRANSPORT"])
+
+        tags = fmt.format(self._fmt_influx_tags,
+                          packet_ethernet=tags_packet_eth,
+                          packet_ip=tags_packet_ip,
+                          packet_transport=tags_packet_transport,
+                          packet_type=packet_type,
                           **ev)
+        fields = fmt.format(self._fmt_influx_fields,
+                          packet_ethernet=fields_packet_eth,
+                          packet_ip=fields_packet_ip,
+                          packet_transport=fields_packet_transport,
+                          **ev)
+        timestamp = int(round(time.time() * 1000000000))
+        line = fmt.format(self._fmt_influx,
+                          influx_tags=tags,
+                          influx_fields=fields,
+                          influx_timestamp=timestamp)
         return line.replace("\n","")
 
     def __str__(self):
@@ -638,9 +673,18 @@ def get_trap_info(trap_id):
 
 # convert trap event into WJH event
 def process_trap_event(cpu, data, size):
-    event = Event       ()
+    event = Event()
     packet = dict()
-    
+    protocols = {
+        IPPROTO_TCP: "tcp",
+        IPPROTO_UDP: "udp"
+    }
+    drop_types = {
+        "l2_drops": "l2",
+        "l3_drops": "l3",
+        "tunnel_drops": "tunnel"
+    }
+
     trap = ct.cast(data, ct.POINTER(TrapEvent)).contents
     
     packet["packetType"] = "ETHERNET"
@@ -657,7 +701,8 @@ def process_trap_event(cpu, data, size):
             "srcIp": socket.inet_ntop(socket.AF_INET, struct.pack('I',  trap.packet.saddrv4)), 
             "dstIp": socket.inet_ntop(socket.AF_INET, struct.pack('I',  trap.packet.daddrv4)), 
             "protocol": trap.packet.ip_proto,
-            "protocolName": str(trap.packet.ip_proto),
+            "protocolName": "{} ({})".format(hex(trap.packet.ip_proto), 
+                            protocols.get(trap.packet.ip_proto, "Unknown")),
             "length": trap.packet.length,
             "tos": trap.packet.tos,
             "ttl": trap.packet.ttl
@@ -668,7 +713,8 @@ def process_trap_event(cpu, data, size):
             "srcIp": socket.inet_ntop(socket.AF_INET6, trap.packet.saddrv6), 
             "dstIp": socket.inet_ntop(socket.AF_INET6, trap.packet.daddrv6), 
             "protocol": trap.packet.ip_proto,
-            "protocolName": hex(trap.packet.ip_proto),
+            "protocolName": "{} ({})".format(hex(trap.packet.ip_proto), 
+                            protocols.get(trap.packet.ip_proto, "Unknown")),
             "length": trap.packet.length,
             "tos": trap.packet.tos,
             "ttl": trap.packet.ttl
@@ -679,8 +725,10 @@ def process_trap_event(cpu, data, size):
         packet["TRANSPORT"] = {
             "srcPort": trap.packet.sport, 
             "dstPort": trap.packet.dport,
-            "srcPortName": str(trap.packet.sport),
-            "dstPortName": str(trap.packet.dport)
+            "srcPortName": socket.getservbyport(trap.packet.sport,
+                                protocols.get(trap.packet.ip_proto, "")),
+            "dstPortName": socket.getservbyport(trap.packet.dport,
+                                protocols.get(trap.packet.ip_proto, "")),
         }
         packet["packetType"] = "TRANSPORT"            
     
@@ -690,7 +738,7 @@ def process_trap_event(cpu, data, size):
     reason, descr, severity = trap_info 
     event["description"] = descr
     event["severity"] = severity
-    event["dropType"] = "l2"
+    event["dropType"] = drop_types.get(trap.group_name.decode("utf-8"), "")
     event["dropReason"] = reason
     event["timestamp"] = str(time.time())
     event["message"] = "fwdDrop"
