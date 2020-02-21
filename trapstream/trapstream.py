@@ -19,25 +19,23 @@ except ImportError:
 try:
     from bcc import BPF
     from bcc.utils import printb
-except ImportError:
-    sys.stderr.write("Can't import bcc library\n")
-    exit(1)
+except ImportError as e:
+    sys.stderr.write("Error importing python bcc library: {}\n".format(e))
+    sys.exit(1)
 
 ETH_ALEN = 6
 ETH_P_IP = 0x0800
 ETH_P_IPV6 = 0x86DD
+
 TRAP_NAME_LEN = 40
 TRAP_GROUP_NAME_LEN = 20
 IFNAMSIZ = 16
-IPPROTO_TCP = 6
-IPPROTO_UDP = 17
 
 DEFAULT_SEND_INTERVAL = 5.0 # seconds
 DEFAULT_RETRY_TIMEOUT = 10.0 # seconds
 DEFAULT_BATCH_SIZE = 20
 DEFAULT_STREAM_FORMAT = "json"
 
-b = None
 streamer = None
 wjh_events_queue = None
 verbose = False
@@ -467,8 +465,15 @@ class TrapEvent(ct.Structure):
 
 
 class EventFormatInflux(object):
-
+    """
+    A class used to represent WJH event formatting for
+    InfluxDB line protocol.
+    https://docs.influxdata.com/influxdb/v1.7/write_protocols/line_protocol_tutorial
+    """
     class InfluxFormatter(string.Formatter):
+        """
+        A class to define a custom string formatter for InfluxDB line protocol
+        """
         def convert_field(self, value, conversion):
             if conversion == 'w':
                 return str(value).replace(' ', '\\ ')
@@ -582,6 +587,10 @@ DroppedPackets,{influx_tags} {influx_fields} {influx_timestamp}
         
 
 class Event(dict):
+    """
+    A class to represent single WJH event for streaming.
+    """
+    # process special formatting of the event
     def format(self, fmt):
         if fmt == "influx":
             return str(EventFormatInflux(self))
@@ -589,6 +598,10 @@ class Event(dict):
     
 
 class Queue(queue.Queue):
+    """
+    A class to implement extended Queue, which supports
+    atomic getting of all elements from it (draining the queue).
+    """
     def getall(self):
         arr = []
         with self.mutex:
@@ -604,6 +617,13 @@ class Queue(queue.Queue):
         return arr
 
 class Streamer(threading.Thread):
+    """
+    A class to implement custom thread for streaming WJH events
+    to a remote collector.
+    Streaming formats supported:
+        - json (default)
+        - influx
+    """
     def __init__(self, events_queue, collector_ip, collector_port,
                  interval=DEFAULT_SEND_INTERVAL,
                  retry_timeout=DEFAULT_RETRY_TIMEOUT,
@@ -639,7 +659,7 @@ class Streamer(threading.Thread):
             while not self._stop_event.isSet():
                 self._stop_event.wait(self.interval)
                 events = self.events_queue.getall()
-                print("Got %d WJH events from queue" % (len(events)))
+                print("Got %d WJH events from the queue" % (len(events)))
                 while events:
                     # send events in batches
                     batch = events[:self.batch_size]
@@ -667,23 +687,32 @@ class Streamer(threading.Thread):
         print('Shutting down streamer...')
         self.join()    
 
+def get_drop_type(group_name):
+    """
+    A function to map devlink trap group names into unified Mellanox WJH drop types.
+    """
+    return group_name.split("_")[0]
 
 def get_trap_info(trap_id):
+    """
+    A function to retrieve extended WJH event information from devlink trap name.
+    """
     return trap_reasons_map.get(trap_id, (trap_id, "N/A", "N/A"))
 
-# convert trap event into WJH event
+def get_protobynumber(number):
+    """
+    A fundtion to retrieve ip protocol name from its numerical value
+    """
+    table = {num: name[8:] for name, num in vars(socket).items() if name.startswith("IPPROTO")}
+    return table.get(number, "").lower()
+
 def process_trap_event(cpu, data, size):
+    """
+    A callback function to capture perf events from eBPF program,
+    convert them into WJH events and then put them in the queue for streaming.
+    """
     event = Event()
     packet = dict()
-    protocols = {
-        IPPROTO_TCP: "tcp",
-        IPPROTO_UDP: "udp"
-    }
-    drop_types = {
-        "l2_drops": "l2",
-        "l3_drops": "l3",
-        "tunnel_drops": "tunnel"
-    }
 
     trap = ct.cast(data, ct.POINTER(TrapEvent)).contents
     
@@ -696,13 +725,13 @@ def process_trap_event(cpu, data, size):
         "vlanId": trap.packet.vlan_id,
         "pcp": trap.packet.vlan_pcp
     }
+    proto_name = get_protobynumber(trap.packet.ip_proto)
     if trap.packet.addr_proto == ETH_P_IP:
         packet["IP"] = {
             "srcIp": socket.inet_ntop(socket.AF_INET, struct.pack('I',  trap.packet.saddrv4)), 
             "dstIp": socket.inet_ntop(socket.AF_INET, struct.pack('I',  trap.packet.daddrv4)), 
             "protocol": trap.packet.ip_proto,
-            "protocolName": "{} ({})".format(hex(trap.packet.ip_proto), 
-                            protocols.get(trap.packet.ip_proto, "Unknown")),
+            "protocolName": "{} ({})".format(trap.packet.ip_proto, proto_name),
             "length": trap.packet.length,
             "tos": trap.packet.tos,
             "ttl": trap.packet.ttl
@@ -713,22 +742,27 @@ def process_trap_event(cpu, data, size):
             "srcIp": socket.inet_ntop(socket.AF_INET6, trap.packet.saddrv6), 
             "dstIp": socket.inet_ntop(socket.AF_INET6, trap.packet.daddrv6), 
             "protocol": trap.packet.ip_proto,
-            "protocolName": "{} ({})".format(hex(trap.packet.ip_proto), 
-                            protocols.get(trap.packet.ip_proto, "Unknown")),
+            "protocolName": "{} ({})".format(trap.packet.ip_proto, proto_name),
             "length": trap.packet.length,
             "tos": trap.packet.tos,
             "ttl": trap.packet.ttl
         }
         packet["packetType"] = "IP"
-    
-    if trap.packet.ip_proto in (IPPROTO_TCP, IPPROTO_UDP):
+
+    if trap.packet.ip_proto in (socket.IPPROTO_TCP, socket.IPPROTO_UDP):
+        src_port_name = "Unknown"
+        dst_port_name = "Unknown"
+        try:
+            src_port_name = socket.getservbyport(trap.packet.sport, proto_name)
+            dst_port_name = socket.getservbyport(trap.packet.dport, proto_name)
+        except:
+            pass
+
         packet["TRANSPORT"] = {
             "srcPort": trap.packet.sport, 
             "dstPort": trap.packet.dport,
-            "srcPortName": socket.getservbyport(trap.packet.sport,
-                                protocols.get(trap.packet.ip_proto, "")),
-            "dstPortName": socket.getservbyport(trap.packet.dport,
-                                protocols.get(trap.packet.ip_proto, "")),
+            "srcPortName": "{} ({})".format(trap.packet.sport, src_port_name),
+            "dstPortName": "{} ({})".format(trap.packet.dport, dst_port_name),
         }
         packet["packetType"] = "TRANSPORT"            
     
@@ -738,7 +772,7 @@ def process_trap_event(cpu, data, size):
     reason, descr, severity = trap_info 
     event["description"] = descr
     event["severity"] = severity
-    event["dropType"] = drop_types.get(trap.group_name.decode("utf-8"), "")
+    event["dropType"] = get_drop_type(trap.group_name.decode("utf-8"))
     event["dropReason"] = reason
     event["timestamp"] = str(time.time())
     event["message"] = "fwdDrop"
@@ -746,14 +780,23 @@ def process_trap_event(cpu, data, size):
     
     if verbose:
         print(event)
+    # put event in the queue for further streaming
     wjh_events_queue.put(event)
 
 def sig_handler(signum, stack):
+    """
+    A function to handle OS signals to be able to gracefully shutdown
+    the program.
+    """
     print('Exiting...')
     streamer.shutdown()
     sys.exit(signum)
 
 def get_devlink_trap_reasons_map():
+    """
+    A function to map devlink trap names into unified Mellanox WJH event
+    names and their additional attributes.
+    """
     devlink_trap_reasons_map = {
         "source_mac_is_multicast": TRAP_SMAC_MC,
         "vlan_tag_mismatch": TRAP_VLAN_TAG_MISMATCH,
@@ -782,16 +825,11 @@ def get_devlink_trap_reasons_map():
     }
     return devlink_trap_reasons_map
 
-def bpf_load_program(file):
-    bpf_text = None
-    try:
-        with open(file, "r") as f:
-            bpf_text = f.read()
-    except:
-        return None
-    return bpf_text
-
 def bpf_parametrize(bpf_text, args):
+    """
+    A function to change specific parameters in eBPF program code
+    to customize it before compiling and executing in the kernel.
+    """
     res = bpf_text
     if args.unique_interval:
         print("Unique flows filtering enabled (within %ds interval)" % args.unique_interval)
@@ -801,12 +839,14 @@ def bpf_parametrize(bpf_text, args):
     return res
         
 def main(args):
+    """
+    Main entry point.
+    """
     global verbose
     global device_ip
     global wjh_events_queue
     global trap_reasons_map
     global streamer
-    global b
 
     verbose = args.verbose
     device_ip = args.device_ip
@@ -827,7 +867,7 @@ def main(args):
     else:
         print("ERROR: devlink_trap_report() kernel function not found or traceable. "
             "Older kernel versions not supported.")
-        sys.exit()
+        sys.exit(1)
 
     b["stream_trap_events"].open_perf_buffer(process_trap_event)
 
