@@ -389,25 +389,28 @@ static __always_inline void flow_dissector(struct sk_buff *skb,
         }
 }
 
-int probe_devlink_trap_report_stream(struct pt_regs *ctx, struct devlink *devlink,
-			      struct sk_buff *skb, void *trap_ctx)
+RAW_TRACEPOINT_PROBE(devlink_trap_report)
+// TP_PROTO(const struct devlink *devlink, struct sk_buff *skb,
+//          const struct devlink_trap_metadata *metadata)
 {
-        struct devlink_trap_item *trap_item;
-        const struct devlink_trap *trap;
+        struct sk_buff *skb = (struct sk_buff *) ctx->args[1];
+        const struct devlink_trap_metadata *metadata;
         struct trap_data trap_data = {};
         struct trap_flow_info *val, zero = {};
         struct flow_key_record *flow = &trap_data.packet;
         __u64 ts;
 
-        trap_item = (struct devlink_trap_item *) trap_ctx;
-        trap = trap_item->trap;
+        metadata = (struct devlink_trap_metadata *) ctx->args[2];
+
+        // skip control plane exceptions
+        if (metadata->trap_type == DEVLINK_TRAP_TYPE_CONTROL)
+            return 0;
 
         flow_dissector(skb, flow);
 
-        bpf_probe_read(&trap_data.id, sizeof(trap_data.id), &trap->id);
-        bpf_probe_read_str(&trap_data.name, TRAP_NAME_LEN, trap->name);
+        bpf_probe_read_str(&trap_data.name, TRAP_NAME_LEN, metadata->trap_name);
         bpf_probe_read_str(&trap_data.group_name, TRAP_GROUP_NAME_LEN,
-                        trap->group.name);
+                        metadata->trap_group_name);
         bpf_probe_read_str(&trap_data.in_port_name, IFNAMSIZ, 
                         skb->dev->name);
 
@@ -861,12 +864,8 @@ def main(args):
     
     trap_reasons_map = get_devlink_trap_reasons_map()
     b = BPF(text=bpf_parametrize(bpf_text, args))
-    if b.get_kprobe_functions(b"devlink_trap_report"):
-        b.attach_kprobe(event="devlink_trap_report", 
-                        fn_name="probe_devlink_trap_report_stream")
-    else:
-        print("ERROR: devlink_trap_report() kernel function not found or traceable. "
-            "Older kernel versions not supported.")
+    if not BPF.support_raw_tracepoint():
+        print("ERROR: RAW_TRACEPOINT_PROBE is not supported.")
         sys.exit(1)
 
     b["stream_trap_events"].open_perf_buffer(process_trap_event)
@@ -887,11 +886,11 @@ if __name__ == "__main__":
                         help='Collector server port')
     parser.add_argument('-v', '--verbose', help='increase output verbosity',
                     action='store_true')
-    parser.add_argument('-i', '--interval', default=DEFAULT_SEND_INTERVAL,
+    parser.add_argument('-i', '--interval', default=DEFAULT_SEND_INTERVAL, type=int,
                         help='Sent interval')
-    parser.add_argument('-r', '--retry_timeout', default=DEFAULT_RETRY_TIMEOUT,
+    parser.add_argument('-r', '--retry_timeout', default=DEFAULT_RETRY_TIMEOUT, type=int,
                         help='Connection retry timeout')
-    parser.add_argument('-b', '--batch_size', default=DEFAULT_BATCH_SIZE,
+    parser.add_argument('-b', '--batch_size', default=DEFAULT_BATCH_SIZE, type=int,
                         help='Max number of events in one batch to send to collector')
     parser.add_argument('-d', '--device_ip', default="0.0.0.0",
                         help='Device IP address')
