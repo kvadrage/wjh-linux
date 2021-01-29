@@ -15,7 +15,7 @@ After [installing `BCC`][1], run:
 $ ./trapstream.py -i <send_interval> -b <batch_size> -d <local_ip> -f <json|influx> -u <unique_aggregation_interval> <collector_ip> <collector_port>
 ```
 
-It will export metrics such as the below to Prometheus:
+It will export metrics such as the below to some external collector:
 
 **JSON:**
 ```json
