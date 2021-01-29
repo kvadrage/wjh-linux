@@ -8,3 +8,4 @@ Please refer to each tool's page for instructions.
 
 * [Devlink exporter](devlink-exporter)
 * [Aggregated statistics using eBPF](trapagg)
+* [Per-event streaming using eBPF](trapstream)
