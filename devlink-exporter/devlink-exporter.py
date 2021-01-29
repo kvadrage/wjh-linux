@@ -12,8 +12,10 @@ import time
 
 from prometheus_client.core import CounterMetricFamily
 
+
 class DevlinkCollector(object):
-    """Collect devlink metrics and publish them via http or save them to a file."""
+    """Collect devlink metrics and publish them via http or save them to a
+       file."""
 
     def __init__(self, args=None):
         """Construct the object and parse the arguments."""
@@ -68,28 +70,62 @@ class DevlinkCollector(object):
             arguments.interval = 5
         self.args = vars(arguments)
 
-    def update_devlink_stats(self, counter):
-        """Update counter with statistics from devlink trap."""
-        command = ['devlink', '-s', 'trap', '-jp']
+    def devlink_jsonout_get(self, command):
+        """Execute command and return JSON output."""
         try:
             proc = subprocess.Popen(command, stdout=subprocess.PIPE)
-        except FileNotFoundError:
-            logging.critical('devlink not found. Giving up')
-            sys.exit(1)
-        except PermissionError as e:
-            logging.critical('Permission error trying to run devlink: {}'.format(e))
+        except OSError as e:
+            logging.critical(e.strerror)
             sys.exit(1)
         data = proc.communicate()[0]
         if proc.returncode != 0:
             logging.critical('devlink returned non-zero return code')
-            return
-        jsonout = json.loads(data);
+            sys.exit(1)
+        return json.loads(data)
+
+    def update_devlink_trap_stats(self, counter):
+        """Update counter with statistics from devlink trap."""
+        command = ['devlink', '-s', 'trap', '-jp']
+        jsonout = self.devlink_jsonout_get(command)
 
         for devhandle in jsonout["trap"]:
             for trap in jsonout["trap"][devhandle]:
-                labels = [devhandle, trap["name"], trap["group"]]
-                counter.add_metric(labels + ["rx_bytes"], trap["stats"]["rx"]["bytes"])
-                counter.add_metric(labels + ["rx_packets"], trap["stats"]["rx"]["packets"])
+                labels = [devhandle, trap["name"], trap["group"], trap["type"],
+                          trap["action"]]
+                counter.add_metric(labels + ["rx_bytes"],
+                                   trap["stats"]["rx"]["bytes"])
+                counter.add_metric(labels + ["rx_packets"],
+                                   trap["stats"]["rx"]["packets"])
+
+    def update_devlink_trap_group_stats(self, counter):
+        """Update counter with statistics from devlink trap group."""
+        command = ['devlink', '-s', 'trap', 'group', '-jp']
+        jsonout = self.devlink_jsonout_get(command)
+
+        for devhandle in jsonout["trap_group"]:
+            for trap_group in jsonout["trap_group"][devhandle]:
+                try:
+                    trap_policer = trap_group["policer"]
+                except KeyError:
+                    trap_policer = 0
+                labels = [devhandle, trap_group["name"], str(trap_policer)]
+                counter.add_metric(labels + ["rx_bytes"],
+                                   trap_group["stats"]["rx"]["bytes"])
+                counter.add_metric(labels + ["rx_packets"],
+                                   trap_group["stats"]["rx"]["packets"])
+
+    def update_devlink_trap_policer_stats(self, counter):
+        """Update counter with statistics from devlink trap policer."""
+        command = ['devlink', '-s', 'trap', 'policer', '-jp']
+        jsonout = self.devlink_jsonout_get(command)
+
+        for devhandle in jsonout["trap_policer"]:
+            for trap_policer in jsonout["trap_policer"][devhandle]:
+                labels = [devhandle, str(trap_policer["policer"]),
+                          str(trap_policer["rate"]),
+                          str(trap_policer["burst"])]
+                counter.add_metric(labels,
+                                   trap_policer["stats"]["rx"]["dropped"])
 
     def collect(self):
         """
@@ -98,11 +134,26 @@ class DevlinkCollector(object):
         Collect the metrics and yield them. Prometheus client library
         uses this method to respond to http queries or save them to disk.
         """
-        counter = CounterMetricFamily(
-            'node_net_devlink', 'Devlink data', labels=['device', 'trap', 'group', 'type'])
-        self.update_devlink_stats(counter)
+        counter = CounterMetricFamily('node_net_devlink_trap',
+                                      'Devlink trap data',
+                                      labels=['device', 'trap', 'group',
+                                              'trap_type', 'action', 'type'])
+        self.update_devlink_trap_stats(counter)
         yield counter
 
+        counter = CounterMetricFamily('node_net_devlink_trap_group',
+                                      'Devlink trap group data',
+                                      labels=['device', 'group', 'policer',
+                                              'type'])
+        self.update_devlink_trap_group_stats(counter)
+        yield counter
+
+        counter = CounterMetricFamily('node_net_devlink_trap_policer',
+                                      'Devlink trap policer data',
+                                      labels=['device', 'policer', 'rate',
+                                              'burst', 'dropped'])
+        self.update_devlink_trap_policer_stats(counter)
+        yield counter
 
 if __name__ == '__main__':
     collector = DevlinkCollector()
